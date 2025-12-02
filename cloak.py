@@ -1,171 +1,194 @@
-import cv2, numpy as np, time, json, os, datetime
+import cv2
+import numpy as np
+import time
+import mediapipe as mp
+import joblib
 
-# ---------- Config ----------
-CFG_PATH = "config.json"
-DEFAULT_CFG = {
-    "resolution": [1280, 720],
-    "mode": "chroma",                 # "chroma" | "ml"
-    "chroma_color": "red",            # "red" | "green"
-    "hsv_red1": [0, 120, 70], "hsv_red2": [10, 255, 255],
-    "hsv_red3": [170, 120, 70], "hsv_red4": [180, 255, 255],
-    "hsv_green1": [35, 40, 40], "hsv_green2": [90, 255, 255],
-    "morph_kernel": 5,
-    "smooth_alpha": 0.35,             # EMA for mask smoothing (0..1)
-}
-def load_cfg():
-    if os.path.exists(CFG_PATH):
-        try: return json.load(open(CFG_PATH))
-        except: pass
-    json.dump(DEFAULT_CFG, open(CFG_PATH, "w"), indent=2)
-    return DEFAULT_CFG.copy()
-def save_cfg(cfg): json.dump(cfg, open(CFG_PATH, "w"), indent=2)
 
-# ---------- Optional ML segmentation ----------
-USE_ML = False
-try:
-    import mediapipe as mp
-    mp_selfie = mp.solutions.selfie_segmentation
-    USE_ML = True
-except Exception:
-    USE_ML = False
-
-# ---------- Utils ----------
-def median_background(cap, seconds=1.5, max_frames=60):
+# --------- Background capture utility ---------
+def capture_background(cap, seconds=1.0, max_frames=60):
+    """
+    Capture a short burst of frames and return their median as the background.
+    User should move out of the frame while this runs.
+    """
     frames = []
     t0 = time.time()
-    while time.time()-t0 < seconds and len(frames) < max_frames:
+    print("[INFO] Capturing background... please step out of frame.")
+    while (time.time() - t0) < seconds and len(frames) < max_frames:
         ok, f = cap.read()
-        if ok: frames.append(f)
-    if not frames: return None
-    return np.median(frames, axis=0).astype(np.uint8)
+        if not ok:
+            break
+        f = cv2.flip(f, 1)
+        frames.append(f)
 
-def put_text(img, txt, y, x=10):
-    cv2.putText(img, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+    if not frames:
+        print("[WARN] No frames captured for background.")
+        return None
 
-# ---------- Main ----------
+    bg = np.median(frames, axis=0).astype(np.uint8)
+    print("[INFO] Background captured.")
+    return bg
+
+
+# --------- Hand landmark → feature vector (same format as training) ---------
+def landmarks_to_vector(hand_landmarks):
+    """
+    Convert MediaPipe hand landmarks into a flat [x0, y0, z0, ..., x20, y20, z20] list.
+    This must match the format used in collect_gesture_data.py.
+    """
+    coords = []
+    for lm in hand_landmarks.landmark:
+        coords.extend([lm.x, lm.y, lm.z])
+    return coords
+
+
 def main():
-    cfg = load_cfg()
-    W, H = cfg["resolution"]
+    # --------- Setup camera ---------
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
-    time.sleep(0.5)
+    if not cap.isOpened():
+        print("[ERROR] Could not open camera.")
+        return
 
-    # Background
-    print("Capturing background: step out of frame...")
-    background = median_background(cap, seconds=1.5)
-    if background is None:
-        print("Camera error."); return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    # ML session
-    ml = None
-    if USE_ML:
-        ml = mp_selfie.SelfieSegmentation(model_selection=1)
+    # --------- Setup MediaPipe: person segmentation + hands ---------
+    mp_selfie = mp.solutions.selfie_segmentation
+    segmentor = mp_selfie.SelfieSegmentation(model_selection=1)
 
-    # Recording
-    os.makedirs("recordings", exist_ok=True)
-    writer = None
-    recording = False
+    mp_hands = mp.solutions.hands
+    hands = mp_hands.Hands(
+        max_num_hands=2,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
 
-    ema_mask = None
-    mode = cfg["mode"] if (cfg["mode"] in ["chroma","ml"]) else "chroma"
-    color = cfg["chroma_color"]
-    kernel = np.ones((cfg["morph_kernel"], cfg["morph_kernel"]), np.uint8)
+    # --------- Load trained peace-sign model ---------
+    print("[INFO] Loading gesture model from peace_model.pkl ...")
+    gesture_model = joblib.load("peace_model.pkl")
+    print("[INFO] Gesture model loaded.")
 
-    fps_t0, fps_cnt, fps_val = time.time(), 0, 0.0
+    background = None
+    cloak_on = True   # whether invisibility is active
 
-    print("Hotkeys: Q quit | B recapture bg | C chroma | M ML | 1 red | 2 green | [/] smooth | R record | S snapshot")
+    # For gesture toggle logic
+    gesture_active = False       # True while peace sign is currently visible
+    last_gesture_label = "none"  # "peace" or "none"
+
+    print("=== Invisibility Cloak with Peace-Sign Trigger ===")
+    print("Controls:")
+    print("  B - capture background (step out of the frame)")
+    print("  C - toggle cloak on/off manually")
+    print("  Q - quit")
+    print("Gesture:")
+    print("  Show a PEACE SIGN with your hand to toggle cloak on/off ✔")
+
     while True:
         ok, frame = cap.read()
-        if not ok: break
-        frame = cv2.flip(frame, 1)  # mirror view
+        if not ok:
+            break
 
-        # --- mask compute ---
-        if mode == "chroma":
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            if color == "red":
-                l1,u1 = np.array(cfg["hsv_red1"]), np.array(cfg["hsv_red2"])
-                l2,u2 = np.array(cfg["hsv_red3"]), np.array(cfg["hsv_red4"])
-                m = cv2.inRange(hsv, l1,u1) | cv2.inRange(hsv, l2,u2)
-            else: # green
-                l,u = np.array(cfg["hsv_green1"]), np.array(cfg["hsv_green2"])
-                m = cv2.inRange(hsv, l,u)
-        else:  # ML
-            if USE_ML and ml is not None:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                res = ml.process(rgb)
-                seg = (res.segmentation_mask * 255).astype(np.uint8)
-                _, m = cv2.threshold(seg, 128, 255, cv2.THRESH_BINARY)  # person=white
-            else:
-                m = np.zeros(frame.shape[:2], dtype=np.uint8)
+        frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
+        out = frame.copy()
 
-        # For ML: we want to hide person; for chroma: hide cloak color.
-        # Either way, "m" denotes region to replace with background.
-        # Refine mask
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel, iterations=1)
-        m = cv2.morphologyEx(m, cv2.MORPH_DILATE, kernel, iterations=1)
+        # Convert once to RGB for both segmentation and hands
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # EMA smoothing
-        alpha = float(cfg["smooth_alpha"])
-        if ema_mask is None: ema_mask = m.astype(np.float32)
-        else: ema_mask = alpha*m + (1-alpha)*ema_mask
-        m_smooth = ema_mask.astype(np.uint8)
+        # --------- Person segmentation for invisibility ---------
+        if background is not None and cloak_on:
+            seg_results = segmentor.process(rgb)
+            mask = seg_results.segmentation_mask  # float [0,1]
 
-        m_inv = cv2.bitwise_not(m_smooth)
-        part_bg = cv2.bitwise_and(background, background, mask=m_smooth)
-        part_fg = cv2.bitwise_and(frame, frame, mask=m_inv)
-        out = cv2.add(part_bg, part_fg)
+            # 1) threshold (slightly low to capture more of the body)
+            bin_mask = (mask > 0.4).astype(np.uint8)
 
-        # FPS
-        fps_cnt += 1
-        if time.time() - fps_t0 >= 0.5:
-            fps_val = fps_cnt / (time.time() - fps_t0)
-            fps_cnt, fps_t0 = 0, time.time()
+            # 2) Morphological cleanup
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            closed = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-        # HUD
-        put_text(out, f"Mode: {mode.upper()} ({'red' if color=='red' else 'green'} cloak)" if mode=='chroma' else f"Mode: ML Segmentation ({'enabled' if USE_ML else 'unavailable'})", 25)
-        put_text(out, f"FPS: {fps_val:.1f} | Smooth alpha: {cfg['smooth_alpha']:.2f}", 50)
-        put_text(out, "Keys: Q quit  B bg  C chroma  M ml  1 red  2 green  [/] smooth  R rec  S snap", 75)
+            # 3) inner core + edge band
+            dilated = cv2.dilate(closed, kernel, iterations=2)
+            eroded = cv2.erode(closed, kernel, iterations=1)
 
-        cv2.imshow("Invisibility Cloak", out)
-        k = cv2.waitKey(1) & 0xFF
-        if k == ord('q'): break
-        elif k == ord('b'):
-            print("Re-capturing background..."); background = median_background(cap, seconds=1.2); ema_mask=None
-        elif k == ord('c'):
-            mode = "chroma"; cfg["mode"]=mode
-        elif k == ord('m'):
-            mode = "ml"; cfg["mode"]=mode
-        elif k == ord('1'):
-            color = "red"; cfg["chroma_color"]=color
-        elif k == ord('2'):
-            color = "green"; cfg["chroma_color"]=color
-        elif k == ord('['):
-            cfg["smooth_alpha"] = max(0.05, cfg["smooth_alpha"] - 0.05)
-        elif k == ord(']'):
-            cfg["smooth_alpha"] = min(0.95, cfg["smooth_alpha"] + 0.05)
-        elif k == ord('r'):
-            recording = not recording
-            if recording:
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                writer = cv2.VideoWriter(os.path.join("recordings", f"cloak_{ts}.mp4"), fourcc, 20.0, (out.shape[1], out.shape[0]))
-                print("Recording ON")
-            else:
-                if writer: writer.release(); writer=None
-                print("Recording OFF")
-        elif k == ord('s'):
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = os.path.join("recordings", f"snapshot_{ts}.png")
-            cv2.imwrite(path, out); print(f"Saved {path}")
+            core = eroded
+            edge = cv2.subtract(dilated, eroded)
 
-        # write frame if recording
-        if recording and writer: writer.write(out)
+            frame_f = frame.astype(np.float32)
+            bg_f = background.astype(np.float32)
+            out_f = frame_f.copy()
 
-    save_cfg(cfg)
-    if writer: writer.release()
+            # fully replace core with background
+            core_idx = core.astype(bool)
+            out_f[core_idx] = bg_f[core_idx]
+
+            # mix edge band
+            edge_idx = edge.astype(bool)
+            alpha = 0.6
+            out_f[edge_idx] = alpha * bg_f[edge_idx] + (1.0 - alpha) * frame_f[edge_idx]
+
+            out = out_f.astype(np.uint8)
+
+        # --------- Gesture detection (MediaPipe Hands + classifier) ---------
+        gesture_label = "none"
+        hands_results = hands.process(rgb)
+
+        if hands_results.multi_hand_landmarks:
+            for hand_landmarks in hands_results.multi_hand_landmarks:
+                features = landmarks_to_vector(hand_landmarks)
+                pred = gesture_model.predict([features])[0]  # 'peace' or 'other'
+
+                if pred == "peace":
+                    gesture_label = "peace"
+                    # Optional: draw landmarks to visualize
+                    mp.solutions.drawing_utils.draw_landmarks(
+                        out,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        landmark_drawing_spec=mp.solutions.drawing_styles.get_default_hand_landmarks_style(),
+                        connection_drawing_spec=mp.solutions.drawing_styles.get_default_hand_connections_style()
+                    )
+                    break  # we only need one peace hand to trigger
+
+        # Edge-triggered toggle: only toggle when we go from "no peace" -> "peace"
+        if gesture_label == "peace" and not gesture_active:
+            # rising edge: peace sign just appeared
+            cloak_on = not cloak_on
+            gesture_active = True
+            print(f"[INFO] Peace sign detected → cloak_on = {cloak_on}")
+        elif gesture_label != "peace":
+            # reset when peace sign disappears
+            gesture_active = False
+
+        # --------- HUD text ---------
+        status1 = f"Cloak: {'ON' if cloak_on else 'OFF'} | BG: {'SET' if background is not None else 'NONE'}"
+        status2 = f"Gesture: {gesture_label.upper() if gesture_label != 'none' else 'NONE'} (peace toggles cloak)"
+
+        cv2.putText(out, status1, (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(out, status2, (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        cv2.putText(out, "Q: quit  |  B: capture background  |  C: toggle cloak",
+                    (10, h - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+        cv2.imshow("Phase 1+2 – Invisibility Cloak (Peace Trigger)", out)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('b'):
+            background = capture_background(cap, seconds=1.0)
+        elif key == ord('c'):
+            cloak_on = not cloak_on
+
+    # --------- Cleanup ---------
+    hands.close()
+    segmentor.close()
     cap.release()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
