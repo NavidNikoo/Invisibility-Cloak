@@ -3,6 +3,13 @@ import numpy as np
 import time
 import mediapipe as mp
 import joblib
+import os
+
+MODEL_PATH = "gesture_model.pkl"  # trained multi-gesture model
+
+# Directory for gesture-triggered snapshots
+SNAPSHOT_DIR = "snapshots"
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 
 # --------- Background capture utility ---------
@@ -49,7 +56,7 @@ def main():
         print("[ERROR] Could not open camera.")
         return
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     # --------- Setup MediaPipe: person segmentation + hands ---------
@@ -63,25 +70,36 @@ def main():
         min_tracking_confidence=0.5
     )
 
-    # --------- Load trained peace-sign model ---------
-    print("[INFO] Loading gesture model from peace_model.pkl ...")
-    gesture_model = joblib.load("peace_model.pkl")
+    # --------- Load trained gesture model ---------
+    print(f"[INFO] Loading gesture model from {MODEL_PATH} ...")
+    gesture_model = joblib.load(MODEL_PATH)
     print("[INFO] Gesture model loaded.")
 
     background = None
     cloak_on = True   # whether invisibility is active
+    snapshot_idx = 0  # for naming snapshot files
 
-    # For gesture toggle logic
-    gesture_active = False       # True while peace sign is currently visible
-    last_gesture_label = "none"  # "peace" or "none"
+    # For edge-triggered gesture logic
+    active_gestures = set()   # labels present in previous frame
+    should_quit = False       # set to True when open_palm is detected
 
-    print("=== Invisibility Cloak with Peace-Sign Trigger ===")
-    print("Controls:")
+    # Gesture → description for HUD / logs
+    # Make sure these keys match the label strings in gesture_data.csv
+    GESTURE_DESCRIPTIONS = {
+        "peace": "Toggle cloak",
+        "open_palm": "Quit app",
+        "thumbs_up": "Snapshot"
+    }
+
+    print("=== Invisibility Cloak – Multi-Gesture Control ===")
+    print("Keyboard controls:")
     print("  B - capture background (step out of the frame)")
     print("  C - toggle cloak on/off manually")
     print("  Q - quit")
-    print("Gesture:")
-    print("  Show a PEACE SIGN with your hand to toggle cloak on/off ✔")
+    print("Gesture controls (from model labels):")
+    print("  peace       → toggle cloak on/off")
+    print("  open_palm   → quit application")
+    print("  thumbs_up   → save snapshot to ./snapshots")
 
     while True:
         ok, frame = cap.read()
@@ -130,17 +148,18 @@ def main():
             out = out_f.astype(np.uint8)
 
         # --------- Gesture detection (MediaPipe Hands + classifier) ---------
-        gesture_label = "none"
         hands_results = hands.process(rgb)
+        frame_gestures = set()   # gestures seen in THIS frame
 
         if hands_results.multi_hand_landmarks:
             for hand_landmarks in hands_results.multi_hand_landmarks:
                 features = landmarks_to_vector(hand_landmarks)
-                pred = gesture_model.predict([features])[0]  # 'peace' or 'other'
+                pred_label = gesture_model.predict([features])[0]  # e.g. 'peace', 'open_palm', ...
 
-                if pred == "peace":
-                    gesture_label = "peace"
-                    # Optional: draw landmarks to visualize
+                frame_gestures.add(pred_label)
+
+                # Optional: only draw for "known" gestures to avoid clutter
+                if pred_label in GESTURE_DESCRIPTIONS:
                     mp.solutions.drawing_utils.draw_landmarks(
                         out,
                         hand_landmarks,
@@ -148,21 +167,50 @@ def main():
                         landmark_drawing_spec=mp.solutions.drawing_styles.get_default_hand_landmarks_style(),
                         connection_drawing_spec=mp.solutions.drawing_styles.get_default_hand_connections_style()
                     )
-                    break  # we only need one peace hand to trigger
 
-        # Edge-triggered toggle: only toggle when we go from "no peace" -> "peace"
-        if gesture_label == "peace" and not gesture_active:
-            # rising edge: peace sign just appeared
-            cloak_on = not cloak_on
-            gesture_active = True
-            print(f"[INFO] Peace sign detected → cloak_on = {cloak_on}")
-        elif gesture_label != "peace":
-            # reset when peace sign disappears
-            gesture_active = False
+        # --------- Edge-triggered gesture handling ---------
+        # rising_edges = gestures that just appeared in this frame
+        rising_edges = frame_gestures - active_gestures
+
+        for label in rising_edges:
+            if label == "peace":
+                cloak_on = not cloak_on
+                state = "ON" if cloak_on else "OFF"
+                print(f"[GESTURE] peace → toggle cloak → {state}")
+
+            elif label == "open_palm":
+                # use open_palm as "quit" gesture
+                print("[GESTURE] open_palm → QUIT")
+                should_quit = True
+
+            elif label == "thumbs_up":
+                # save snapshot of current output frame
+                fname = os.path.join(SNAPSHOT_DIR, f"snapshot_{snapshot_idx:04d}.png")
+                cv2.imwrite(fname, out)
+                snapshot_idx += 1
+                print(f"[GESTURE] thumbs_up → saved snapshot to {fname}")
+
+            else:
+                # other labels: no bound action (but still visible in HUD)
+                pass
+
+        # update active gestures for next frame
+        active_gestures = frame_gestures
+
+        # if a quit gesture was seen, break out of the main loop
+        if should_quit:
+            break
 
         # --------- HUD text ---------
         status1 = f"Cloak: {'ON' if cloak_on else 'OFF'} | BG: {'SET' if background is not None else 'NONE'}"
-        status2 = f"Gesture: {gesture_label.upper() if gesture_label != 'none' else 'NONE'} (peace toggles cloak)"
+
+        # Show all gestures currently visible (even if they didn't just trigger)
+        if frame_gestures:
+            gest_str = ", ".join(sorted(list(frame_gestures)))
+        else:
+            gest_str = "NONE"
+
+        status2 = f"Gestures: {gest_str}"
 
         cv2.putText(out, status1, (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -173,8 +221,9 @@ def main():
                     (10, h - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-        cv2.imshow("Phase 1+2 – Invisibility Cloak (Peace Trigger)", out)
+        cv2.imshow("Invisibility Cloak – Multi-Gesture Control", out)
 
+        # --------- Keyboard fallbacks ---------
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break

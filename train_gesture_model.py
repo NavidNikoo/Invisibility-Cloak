@@ -8,38 +8,40 @@ from sklearn.metrics import classification_report, confusion_matrix
 import joblib
 
 CSV_PATH = "gesture_data.csv"
-MODEL_PATH = "peace_model.pkl"
+MODEL_PATH = "gesture_model.pkl"  # updated name
+
 
 def main():
-    # --------- Load data ----------
-    print(f"[INFO] Loading data from {CSV_PATH} ...")
-    df = pd.read_csv(CSV_PATH)
+    print(f"[INFO] Loading data from {CSV_PATH}...")
 
-    # label column is 'label'; everything else is features
-    y = df["label"].values
-    X = df.drop(columns=["label"]).values
+    # 🔹 No header in the CSV – first row is already data
+    df = pd.read_csv(CSV_PATH, header=None)
+    print("[DEBUG] Shape:", df.shape)
+
+    # column 0 = label, columns 1..end = features
+    y = df.iloc[:, 0].values
+    X = df.iloc[:, 1:].values
 
     print(f"[INFO] Dataset shape: {X.shape}, labels: {np.unique(y, return_counts=True)}")
 
-    # --------- Train / test split ----------
+    # stratified train/test because we have multiple gestures
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y  # keep class balance in both splits
+        X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # --------- Build model pipeline ----------
-    # Standardize features + Logistic Regression classifier
+    # pipeline: scaling + multi-class classifier
     model = make_pipeline(
         StandardScaler(),
-        LogisticRegression(max_iter=200, solver="lbfgs")
+        LogisticRegression(
+            max_iter=400,
+            solver="lbfgs",
+            multi_class="auto"
+        )
     )
 
     print("[INFO] Training model...")
     model.fit(X_train, y_train)
 
-    # --------- Evaluation ----------
     y_pred = model.predict(X_test)
 
     print("\n=== Classification Report ===")
@@ -48,7 +50,6 @@ def main():
     print("=== Confusion Matrix ===")
     print(confusion_matrix(y_test, y_pred))
 
-    # --------- Save model ----------
     joblib.dump(model, MODEL_PATH)
     print(f"\n[INFO] Saved trained model to {MODEL_PATH}")
 
