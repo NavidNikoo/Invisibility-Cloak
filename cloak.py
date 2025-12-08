@@ -5,7 +5,7 @@ import mediapipe as mp
 import joblib
 import os
 
-from identity_features import face_to_vector   # <-- NEW
+from identity_features import face_to_vector   # face -> vector for identity model
 
 GESTURE_MODEL_PATH = "gesture_model.pkl"      # trained multi-gesture model
 IDENTITY_MODEL_PATH = "identity_model.pkl"    # trained navid vs other
@@ -152,6 +152,8 @@ def main():
         # 2) IDENTITY DETECTION (who is Navid?)
         # -------------------------------------------------
         navid_centers = []
+        has_navid = False
+        has_other = False
         identity_status = "OFF"
 
         if identity_enabled:
@@ -168,49 +170,51 @@ def main():
                     cy = int(np.mean(ys) * h)
 
                     if pred_id == "navid":
+                        has_navid = True
                         navid_centers.append((cx, cy))
-                        identity_status = "NAVID PRESENT"
-                        # green circle for Navid
-                        cv2.circle(out, (cx, cy), 10, (0, 255, 0), 2)
+                        cv2.circle(out, (cx, cy), 10, (0, 255, 0), 2)  # green for Navid
                     else:
-                        # red circle for others
-                        cv2.circle(out, (cx, cy), 10, (0, 0, 255), 2)
+                        has_other = True
+                        cv2.circle(out, (cx, cy), 10, (0, 0, 255), 2)  # red for others
 
-            if not navid_centers and identity_status != "OFF":
-                identity_status = "NO NAVID"
+            # Build status string for HUD
+            if has_navid and has_other:
+                identity_status = "Navid and other"
+            elif has_navid:
+                identity_status = "Navid"
+            elif has_other:
+                identity_status = "other"
+            else:
+                identity_status = "no face"
         else:
-            identity_status = "DISABLED"
+            identity_status = "disabled"
+
+        # After identity detection, estimate Navid's horizontal position (0–1)
+        navid_x_norm = None
+        if navid_centers:
+            navid_x_norm = np.mean([cx for (cx, cy) in navid_centers]) / float(w)
 
         # -------------------------------------------------
         # 3) BUILD NAVID-ONLY PERSON MASK
         # -------------------------------------------------
-        # If identity model is available and Navid is detected, we cloak only his blobs.
-        # Otherwise, we cloak everyone (bin_mask).
+        # Default: cloak everyone in the person mask
         target_mask = bin_mask.copy()
 
         if identity_enabled and navid_centers:
             navid_person_mask = np.zeros_like(bin_mask)
 
-            for i in range(1, num_labels):
-                x_i, y_i, w_i, h_i, area_i = stats[i]
-                if area_i < 0.015 * h * w:
-                    continue
+            for (fx, fy) in navid_centers:
+                if 0 <= fx < w and 0 <= fy < h:
+                    label_id = labels_cc[fy, fx]  # which connected component?
+                    if label_id != 0:
+                        # optional: ignore tiny blobs
+                        if stats[label_id, cv2.CC_STAT_AREA] > 0.015 * h * w:
+                            navid_person_mask[labels_cc == label_id] = 1
 
-                # Does any Navid face center fall in this component's bounding box?
-                mark_this = False
-                for (fx, fy) in navid_centers:
-                    if x_i <= fx < x_i + w_i and y_i <= fy < y_i + h_i:
-                        mark_this = True
-                        break
-
-                if mark_this:
-                    navid_person_mask[labels_cc == i] = 1
-
-            # If we found any Navid blobs, use them as target; else fall back to bin_mask
+            # If we found any Navid blobs, use them; otherwise cloak no one
             if navid_person_mask.sum() > 0:
                 target_mask = navid_person_mask
             else:
-                # no matching blobs for navid, so no one cloaked
                 target_mask = np.zeros_like(bin_mask)
 
         # -------------------------------------------------
@@ -242,26 +246,47 @@ def main():
         # -------------------------------------------------
         hands_results = hands.process(rgb)
 
-        # "raw" set of predictions for HUD only
+        # For HUD: all gestures we see in the frame
         frame_raw_gestures = set()
+        # For control: only gestures from hands that belong to Navid
+        navid_control_gestures = set()
 
         if hands_results.multi_hand_landmarks:
             for hand in hands_results.multi_hand_landmarks:
+                # mean hand x-position in normalized coords (0–1)
+                hand_x_mean = np.mean([lm.x for lm in hand.landmark])
+
+                # classify gesture
                 features = landmarks_to_vector(hand)
                 pred_label = gesture_model.predict([features])[0]
                 frame_raw_gestures.add(pred_label)
 
-                if pred_label in GESTURE_DESCRIPTIONS:
-                    mp.solutions.drawing_utils.draw_landmarks(
-                        out, hand, mp_hands.HAND_CONNECTIONS
-                    )
+                # decide if this hand belongs to Navid
+                is_navid_hand = False
+                if identity_enabled and navid_x_norm is not None:
+                    # only accept hands whose center is close to Navid's face in x
+                    if abs(hand_x_mean - navid_x_norm) < 0.18:
+                        is_navid_hand = True
+                else:
+                    # if identity is disabled, allow all hands
+                    is_navid_hand = True
 
-        # ---------- Single-gesture control logic ----------
-        if len(frame_raw_gestures) == 1:
-            control_gestures = set(frame_raw_gestures)   # allowed to trigger
+                if is_navid_hand:
+                    navid_control_gestures.add(pred_label)
+                    if pred_label in GESTURE_DESCRIPTIONS:
+                        mp.solutions.drawing_utils.draw_landmarks(
+                            out, hand, mp_hands.HAND_CONNECTIONS
+                        )
+                else:
+                    # optionally: draw other people's hands differently or skip
+                    pass
+
+        # ---------- Single-gesture control logic (Navid's hands only) ----------
+        if len(navid_control_gestures) == 1:
+            control_gestures = set(navid_control_gestures)   # allowed to trigger
             gesture_mode = "single"
-        elif len(frame_raw_gestures) > 1:
-            control_gestures = set()                     # disable triggers
+        elif len(navid_control_gestures) > 1:
+            control_gestures = set()                         # ambiguous, disable
             gesture_mode = "multi"
         else:
             control_gestures = set()
@@ -341,7 +366,8 @@ def main():
         cv2.putText(out, f"People: {people_count}", (10, 110),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(out, f"Identity: {identity_status}", (10, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if "NAVID" in identity_status else (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 0) if "Navid" in identity_status else (255, 255, 255), 2)
 
         cv2.putText(out, "Q: quit  |  B: capture background  |  C: toggle cloak",
                     (10, h - 20),
